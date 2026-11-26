@@ -86,6 +86,71 @@ def test_build_command() -> None:
     print("PASS  command assembly")
 
 
+def test_speed_and_cost_knobs() -> None:
+    """Workers, thinking switch and the term-token accounting that goes with them."""
+    base = {
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-flash",
+        "api_key": "sk-test",
+        "lang_out": "zh",
+        "output_dir": r"C:\tmp\out",
+        "dual_mode": "side",
+        "watermark": "no_watermark",
+        "qps": 4,
+    }
+    # Reasoning models burn ~3/4 of their completion tokens before writing a
+    # single translated character; the default asks for it to be turned off.
+    tuned = runner.build_command(
+        {**base, "provider": "deepseek", "thinking_mode": "off", "pool_workers": 8},
+        [],
+        "babeldoc.exe",
+    )
+    joined = " ".join(tuned)
+    assert "--openai-thinking disabled" in joined, joined
+    assert "--pool-max-workers 8" in joined, joined
+    assert " --qps 4" in joined, joined
+
+    # Providers without the switch must not receive it (some gateways answer
+    # 400 for an unknown body field, which would fail every batch).
+    for provider in ("qwen", "openai", "openrouter", "google_free", "ollama"):
+        cmd = runner.build_command(
+            {**base, "provider": provider, "thinking_mode": "off"}, [], "babeldoc.exe"
+        )
+        assert "--openai-thinking" not in cmd, (provider, cmd)
+
+    enabled = runner.build_command(
+        {**base, "provider": "zhipu", "thinking_mode": "on"}, [], "babeldoc.exe"
+    )
+    assert "enabled" in enabled and "--openai-thinking" in enabled, enabled
+    assert (
+        "--openai-thinking" not in runner.build_command(
+            {**base, "provider": "deepseek", "thinking_mode": "auto"}, [], "babeldoc.exe"
+        )
+    )
+
+    # Workers are clamped, and 0/absent keeps BabelDOC's own default.
+    assert runner.pool_workers({"pool_workers": 999}) == runner.MAX_POOL_WORKERS
+    assert runner.pool_workers({"pool_workers": -3}) == 0
+    assert runner.pool_workers({}) == 0
+    assert "--pool-max-workers" not in runner.build_command(
+        {**base, "provider": "deepseek", "pool_workers": 0}, [], "babeldoc.exe"
+    )
+
+    # The guard receives the same switch so a separate term-extraction model
+    # cannot keep reasoning on.
+    env = runner.guard_environment(
+        {}, Path(tempfile.gettempdir()) / "guard.json", "doc.pdf",
+        {"provider": "deepseek", "thinking_mode": "off"},
+    )
+    assert env.get("BABELDOC_STUDIO_THINKING") == "disabled", env
+    untouched = runner.guard_environment(
+        {}, Path(tempfile.gettempdir()) / "guard.json", "doc.pdf",
+        {"provider": "qwen", "thinking_mode": "off"},
+    )
+    assert "BABELDOC_STUDIO_THINKING" not in untouched, untouched
+    print("PASS  workers + thinking knobs")
+
+
 def test_output_renaming() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
@@ -252,14 +317,45 @@ def test_usage_and_cost() -> None:
     job.commit_usage()
 
     usage = job.total_usage()
-    assert usage["prompt_tokens"] == 1280, usage
-    assert usage["completion_tokens"] == 320, usage
+    # One model does both phases, so BabelDOC's totals already include the term
+    # extraction calls: adding the "Term extraction tokens" line again would
+    # double count them (this is what used to inflate the shown cost by ~40%).
+    assert usage["prompt_tokens"] == 1200, usage
+    assert usage["completion_tokens"] == 300, usage
     assert usage["cached_tokens"] == 200, usage
+    # …but the share stays visible for the "其中术语提取" note in the UI.
+    assert usage["term_prompt_tokens"] == 80, usage
+    assert usage["term_completion_tokens"] == 20, usage
 
     cost = job.snapshot(0)["cost"]
     assert cost["known"] and cost["currency"] == "CNY", cost
-    expected = 1080 / 1e6 * 2.0 + 200 / 1e6 * 0.5 + 320 / 1e6 * 8.0
+    expected = 1000 / 1e6 * 2.0 + 200 / 1e6 * 0.5 + 300 / 1e6 * 8.0
     assert abs(cost["amount"] - expected) < 1e-9, (cost, expected)
+
+    # A separate term-extraction model reports its own counters, which are NOT
+    # part of the translation totals — those must be added.
+    separate = runner.Job(
+        id="s",
+        config={"model": "deepseek-chat", "provider": "deepseek"},
+        files=[],
+        command=[],
+    )
+    separate.add_log("INFO babeldoc.main:Total tokens: 1000")
+    separate.add_log("INFO babeldoc.main:Prompt tokens: 800")
+    separate.add_log("INFO babeldoc.main:Completion tokens: 200")
+    separate.add_log("INFO babeldoc.main:Cache hit prompt tokens: 0")
+    separate.add_log(
+        "INFO babeldoc.main:Term extraction tokens: total=100 prompt=80 "
+        "completion=20 cache_hit_prompt=0"
+    )
+    separate.add_log(
+        "INFO babeldoc.main:Term extraction translator raw tokens: total=100 "
+        "prompt=80 completion=20 cache_hit_prompt=0"
+    )
+    separate.commit_usage()
+    usage = separate.total_usage()
+    assert usage["prompt_tokens"] == 880, usage
+    assert usage["completion_tokens"] == 220, usage
 
     override = pricing.estimate(
         usage, "some-private-model", "custom",
@@ -276,6 +372,7 @@ def test_usage_and_cost() -> None:
 def main() -> None:
     test_stage_detection()
     test_build_command()
+    test_speed_and_cost_knobs()
     test_output_renaming()
     test_page_specs()
     test_reference_detection()

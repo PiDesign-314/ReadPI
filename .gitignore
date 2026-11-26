@@ -8,6 +8,8 @@ venv/
 .preview/
 .qa/
 .tmp/
+.lead/
+.archify/
 *.log
 
 # Local paper collection (user data, hundreds of MB — never commit)

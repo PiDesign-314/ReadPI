@@ -40,6 +40,15 @@ DEFAULTS: dict = {
     "watermark": "no_watermark",
     "open_when_done": True,
     "qps": 4,
+    # Worker threads for BabelDOC's batch requests.  Wall-clock time scales with
+    # this, not with ``qps`` (which only spaces request starts): a batch is one
+    # round trip, so 8 in flight instead of 4 roughly halves the wait.
+    "pool_workers": 8,
+    # "auto" keeps the model's own default.  "off" asks providers that document
+    # a thinking switch to skip hidden reasoning; measured on one 2-paragraph
+    # batch it cut completion tokens from 338 to 89 with the same translation,
+    # which is the cheapest large win on both latency and cost.
+    "thinking_mode": "off",
     "custom_prompt": "",
     "price_input": "",
     "price_output": "",
@@ -51,6 +60,9 @@ DEFAULTS: dict = {
     "compat_first": False,
     "term_model": "",
     "term_model_enabled": False,
+    # In-app update check (GitHub Releases); see core/update.py.
+    "update_auto_check": True,
+    "update_skip_version": "",
     "ai": {
         "provider": "auto",
         "model": "",

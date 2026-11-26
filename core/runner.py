@@ -78,6 +78,79 @@ STAGE_RULES = [
 
 RATIO_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 
+#: Providers whose OpenAI-compatible endpoint understands the DeepSeek/Zhipu
+#: ``thinking: {"type": "enabled"|"disabled"}`` switch.  BabelDOC forwards it
+#: untouched, so it is only sent for these ids — other gateways answer a 400 for
+#: an unknown request field and every batch would fail.
+THINKING_PROVIDERS = {"deepseek", "zhipu"}
+
+#: ``thinking_mode`` values the UI can produce.
+THINKING_MODES = {"auto", "off", "on"}
+
+#: Upper bound for ``--pool-max-workers``; beyond this a provider is more likely
+#: to answer 429 than to answer faster.
+MAX_POOL_WORKERS = 32
+
+
+def thinking_flag(cfg: dict) -> str:
+    """``"disabled"`` / ``"enabled"`` / ``""`` for BabelDOC's ``--openai-thinking``.
+
+    Reasoning models spend most of their output tokens on hidden reasoning: one
+    measured 2-paragraph batch cost 338 completion tokens with reasoning on and
+    89 with it off, for the same translation.  Turning it off is the single
+    biggest lever on both latency and cost, so the app asks for it by default
+    (``thinking_mode = "off"``) for providers that document the switch.
+    """
+    mode = str(cfg.get("thinking_mode") or "auto").strip().lower()
+    provider = str(cfg.get("provider") or "").strip().lower()
+    if mode not in {"off", "on"} or provider not in THINKING_PROVIDERS:
+        return ""
+    return "disabled" if mode == "off" else "enabled"
+
+
+def pool_workers(cfg: dict) -> int:
+    """Worker threads BabelDOC may use for batch requests (0 = provider default).
+
+    Every batch is one HTTP round trip, and a reasoning model can hold a request
+    for tens of seconds, so throughput scales with the worker count rather than
+    with ``--qps`` (which only spaces request *starts*).
+    """
+    try:
+        value = int(cfg.get("pool_workers") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    return max(1, min(value, MAX_POOL_WORKERS))
+
+
+def speed_profile(cfg: dict) -> list[str]:
+    """Short human-readable summary of the run's speed/cost settings.
+
+    Shown as one ``[studio]`` log line at start so the user can tell why a run is
+    slower or cheaper than the last one without opening the advanced settings.
+    """
+    profile: list[str] = []
+    thinking = thinking_flag(cfg)
+    if thinking == "disabled":
+        profile.append("关闭模型推理")
+    elif thinking == "enabled":
+        profile.append("强制模型推理")
+    workers = pool_workers(cfg)
+    if workers:
+        profile.append(f"{workers} 并发")
+    if cfg.get("dual_mode") == "mono":
+        profile.append("仅译文")
+    elif cfg.get("dual_mode") == "alternate":
+        profile.append("交替页双语")
+    else:
+        profile.append("左右对照双语")
+    if cfg.get("auto_glossary") and cfg.get("save_glossary"):
+        profile.append("自动提取术语")
+    else:
+        profile.append("不自动提取术语")
+    return profile or ["默认设置"]
+
 
 def find_babeldoc(explicit: str = "") -> str | None:
     if explicit and Path(explicit).exists():
@@ -212,6 +285,17 @@ def build_command(
 
     if cfg.get("qps"):
         cmd += ["--qps", str(int(cfg["qps"]))]
+
+    # Batch requests are round trips: with a reasoning model each one can hold a
+    # worker for tens of seconds, so the worker count — not --qps — decides
+    # wall-clock time.  BabelDOC couples the two by default (workers = qps).
+    workers = pool_workers(cfg)
+    if workers:
+        cmd += ["--pool-max-workers", str(workers)]
+
+    thinking = thinking_flag(cfg)
+    if thinking:
+        cmd += ["--openai-thinking", thinking]
 
     prompt = (cfg.get("custom_prompt") or "").strip()
     if cfg.get("reference_prompt"):
@@ -435,18 +519,21 @@ class Job:
                 )
             self._pending_usage = None
 
+        # BabelDOC prints two different term-extraction lines:
+        #   "Term extraction tokens: …"                  -> always
+        #   "Term extraction translator raw tokens: …"   -> only when a separate
+        #                                                   term-extraction model is used
+        # The first one is a *subset* of the totals above when both phases share
+        # the model (babeldoc/main.py logs the translator's counters after term
+        # extraction ran), so it must not be added a second time.  Only the raw
+        # line — which belongs to a different translator instance — is extra.
+        if "term extraction translator raw tokens" in low:
+            if self._record_term_usage(line, "term extraction translator raw tokens"):
+                self.usage_current["term_separate"] = True
+            return
         if "term extraction tokens" in low:
-            match = re.search(
-                r"term extraction tokens:.*?total=(\d+).*?prompt=(\d+).*?"
-                r"completion=(\d+).*?cache_hit_prompt=(\d+)",
-                line,
-                re.I,
-            )
-            if match:
-                self.usage_current["term_total_tokens"] = int(match.group(1))
-                self.usage_current["term_prompt_tokens"] = int(match.group(2))
-                self.usage_current["term_completion_tokens"] = int(match.group(3))
-                self.usage_current["term_cached_tokens"] = int(match.group(4))
+            if self._record_term_usage(line, "term extraction tokens"):
+                self.usage_current.setdefault("term_separate", False)
             return
 
         patterns = {
@@ -467,6 +554,21 @@ class Job:
                 self._pending_usage = key
             return
 
+    def _record_term_usage(self, line: str, label: str) -> bool:
+        match = re.search(
+            re.escape(label) + r":.*?total=(\d+).*?prompt=(\d+).*?"
+            r"completion=(\d+).*?cache_hit_prompt=(\d+)",
+            line,
+            re.I,
+        )
+        if not match:
+            return False
+        self.usage_current["term_total_tokens"] = int(match.group(1))
+        self.usage_current["term_prompt_tokens"] = int(match.group(2))
+        self.usage_current["term_completion_tokens"] = int(match.group(3))
+        self.usage_current["term_cached_tokens"] = int(match.group(4))
+        return True
+
     def commit_usage(self) -> None:
         """Fold the current run's token counters into the job total."""
         with self._lock:
@@ -477,18 +579,30 @@ class Job:
 
     def total_usage(self) -> dict:
         prompt = completion = cached = 0
+        term_prompt = term_completion = 0
         for item in list(self.usage_runs) + [self.usage_current]:
             prompt += int(item.get("prompt_tokens") or 0)
-            prompt += int(item.get("term_prompt_tokens") or 0)
             completion += int(item.get("completion_tokens") or 0)
-            completion += int(item.get("term_completion_tokens") or 0)
             cached += int(item.get("cached_tokens") or 0)
-            cached += int(item.get("term_cached_tokens") or 0)
+            # Term extraction only adds to the totals when it ran on its own
+            # translator (a different model); otherwise BabelDOC already
+            # counted those calls in the totals above.  The share is always
+            # reported so the UI can show where the tokens went.
+            term_prompt += int(item.get("term_prompt_tokens") or 0)
+            term_completion += int(item.get("term_completion_tokens") or 0)
+            if item.get("term_separate"):
+                prompt += int(item.get("term_prompt_tokens") or 0)
+                completion += int(item.get("term_completion_tokens") or 0)
+                cached += int(item.get("term_cached_tokens") or 0)
         return {
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "cached_tokens": cached,
             "total_tokens": prompt + completion,
+            # Reported for the log/UI only; already part of prompt/completion
+            # when the same model does both phases.
+            "term_prompt_tokens": term_prompt,
+            "term_completion_tokens": term_completion,
         }
 
     def snapshot(self, cursor: int = 0, log_limit: int = 800) -> dict:
@@ -637,7 +751,7 @@ def _read_json(path: Path | None) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def guard_environment(env: dict, status_path: Path, doc: str) -> dict:
+def guard_environment(env: dict, status_path: Path, doc: str, cfg: dict | None = None) -> dict:
     """Return *env* with the BabelDOC runtime guard enabled for one run.
 
     The guard lives in ``core/babelguard`` and is imported by the child
@@ -655,6 +769,12 @@ def guard_environment(env: dict, status_path: Path, doc: str) -> dict:
     env["BABELDOC_STUDIO_GUARD"] = "1"
     env["BABELDOC_STUDIO_GUARD_STATUS"] = str(status_path)
     env["BABELDOC_STUDIO_GUARD_DOC"] = str(doc)
+    # ``--openai-thinking`` only reaches the translation model.  A separate
+    # term-extraction model would keep reasoning (and its latency) on, so the
+    # guard applies the same switch to any translator that does not set it.
+    thinking = thinking_flag(cfg or {})
+    if thinking:
+        env["BABELDOC_STUDIO_THINKING"] = thinking
     return env
 
 
@@ -759,7 +879,7 @@ def _spawn_babeldoc(
         directory = Path(tempfile.mkdtemp(prefix=QC_TEMP_PREFIX))
     status_path = directory / "guard.json"
     doc = "、".join(Path(f).name for f in run["files"]) or "document"
-    run_env = guard_environment(env, status_path, doc)
+    run_env = guard_environment(env, status_path, doc, job.config)
     command = build_command(
         job.config, run["files"], job.command[0], pages, compat=compat
     )
@@ -1081,6 +1201,7 @@ class JobManager:
                 f"[studio] 已清理 {cleared} 条空译文缓存（避免再次出现空白译文）"
             )
         before = _snapshot_dir(output_dir)
+        job.add_log(f"[studio] 速度设置：{' · '.join(speed_profile(job.config))}")
         env = dict(os.environ)
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")

@@ -8,6 +8,7 @@
 <link rel="icon" href="/favicon.ico?v=140" sizes="32x32">
 <link rel="icon" href="/favicon.svg?v=140" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/styles.css">
+<link rel="stylesheet" href="/assets/update.css">
 </head>
 <body data-stage="entry">
 <div class="shell">
@@ -383,7 +384,8 @@
             <div class="row toggle-row">
               <div class="row-text">
                 <label class="row-label" for="auto-glossary">自动提取术语</label>
-                <p class="hint">翻译前自动识别专有名词并统一译法</p>
+                <p class="hint">翻译前先扫一遍全文识别专有名词；会多一轮模型调用（约 +20~40% 用量），
+                已有术语库时建议关闭</p>
               </div>
               <label class="switch">
                 <input type="checkbox" id="auto-glossary" checked>
@@ -393,7 +395,8 @@
             <div class="row toggle-row">
               <div class="row-text">
                 <label class="row-label" for="save-glossary">保存自动术语表</label>
-                <p class="hint">把提取结果另存为 CSV，方便复用</p>
+                <p class="hint">把提取结果另存为 CSV，方便复用；关闭后也不再自动提取术语，
+                可省掉一轮全文模型调用</p>
               </div>
               <label class="switch">
                 <input type="checkbox" id="save-glossary" checked>
@@ -439,10 +442,34 @@
                 <label for="qps">并发 QPS</label>
                 <div class="select-wrap"><input id="qps" type="number" min="1" max="200" step="1"></div>
               </div>
+              <div class="row stacked">
+                <div class="row-text">
+                  <label class="row-label" for="pool-workers">同时翻译请求数</label>
+                  <p class="hint">一次发多少条翻译请求（默认 8）。每条请求都要等模型返回，
+                  调大能明显缩短总时长；被服务商限流（429）时调小。</p>
+                </div>
+                <div class="select-wrap">
+                  <input id="pool-workers" type="number" min="1" max="32" step="1">
+                </div>
+              </div>
             </div>
 
             <p class="subhead">模型与费用</p>
             <div class="rows">
+              <div class="row stacked">
+                <div class="row-text">
+                  <label class="row-label" for="thinking-mode">模型推理</label>
+                  <p class="hint">推理模型会先「想一遍」再翻译：同一段译文的输出 tokens 约为关闭后的
+                  4 倍，耗时也大幅增加。DeepSeek / 智谱支持该开关，其他服务商自动忽略。</p>
+                </div>
+                <div class="select-wrap">
+                  <select id="thinking-mode">
+                    <option value="off">关闭（推荐，最快最省）</option>
+                    <option value="auto">跟随模型默认</option>
+                    <option value="on">强制开启（更慢更贵）</option>
+                  </select>
+                </div>
+              </div>
               <div class="row">
                 <label for="term-model">术语提取模型</label>
                 <div class="select-wrap">
@@ -622,5 +649,6 @@
 <div class="toasts" id="toasts"></div>
 <script src="/assets/app.js"></script>
 <script src="/assets/context-menu.js"></script>
+<script src="/assets/update.js" defer></script>
 </body>
 </html>

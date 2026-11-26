@@ -271,3 +271,80 @@ job 快照新增 `quality`（`checked / ok / missing / untranslated / pages / wa
   核对，此时完整性校验退回 PDF 版式兜底路径。
 - 若上游 BabelDOC 升级改变了内部模块/函数名，守卫会记录 `errors` 并以「无状态文件」降级，
   完整性校验自动退回 PDF 兜底路径（`core/runner.py` 不依赖守卫一定安装成功）。
+
+
+## 9. 速度与 token 用量（2026-11 实测）
+
+排查「左右对照翻译很慢、token 很贵」时的结论，后续不必重新调研。测量条件：BabelDOC 0.6.4、
+`deepseek-flash`、`--ignore-cache`、同一份 4 页 NIPS 论文（`papers/`）、`--watermark-output-mode no_watermark`。
+
+### 9.1 左右对照不是慢的原因
+
+| 版式 | 墙钟 | 输入 tokens | 输出 tokens |
+| --- | ---: | ---: | ---: |
+| 仅译文（`--no-dual`） | 55.1 s | 10,841 | 3,237 |
+| 左右对照（默认 side） | 53.6 s | 9,876 | 3,132 |
+
+`high_level.do_translate()` 只翻译一次，双语稿是在 `pdf_creater.write()` 之后由
+`create_side_by_side_dual_pdf()` 拼页生成的（`show_pdf_page`，17 页也就 1 秒级）。
+所以双语版式只多一次 PDF 落盘；感觉「切到左右对照就慢很多」的真实原因是下面两条叠加：
+推理 tokens 让每次请求变慢、以及冷/热翻译缓存（`~/.cache/babeldoc/cache.v1.db`）差异。
+
+### 9.2 推理 tokens 是最大开销
+
+对同一个 BabelDOC 两段式请求做同一段翻译（一次性探测：把 `PROMPT_TEMPLATE` + 两段原文直接 POST 给同一模型，
+读 `usage.completion_tokens_details.reasoning_tokens`）：
+
+| 请求参数 | 输出 tokens | 其中推理 | 译文 |
+| --- | ---: | ---: | --- |
+| 默认 | 338 | 251 | 一致 |
+| `thinking: {"type":"disabled"}` | 89 | 0 | 一致 |
+
+即默认情况下约 3/4 的输出 tokens 是隐藏推理，既不计入译文也不改善质量。BabelDOC 提供
+`--openai-thinking enabled|disabled`（透传到请求体 `thinking` 字段），但**只作用于翻译模型**；
+配置了独立术语提取模型时那个实例不受影响，因此本项目额外用
+`BABELDOC_STUDIO_THINKING` 让 `core/babelguard` 给未显式设置的 `OpenAITranslator` 补上该字段。
+该字段不是 OpenAI 标准，只有 DeepSeek / 智谱文档支持；其他服务商下发可能 400，所以
+`core/runner.py::THINKING_PROVIDERS` 做了白名单。
+
+注意：`BaseTranslator` 在设置 thinking 时会把 `thinking` 加进翻译缓存的 key
+（`add_cache_impact_parameters("thinking", …)`），所以从「推理开」切到「推理关」后，旧缓存不会命中，
+同一篇论文会重译一次（此后命中正常）。
+
+另注：`OpenAITranslator.do_llm_translate` 把 `max_tokens` 硬编码为 2048。推理开启时推理内容
+会吃掉这个额度，长批次容易被截断成非法 JSON，触发「整批失败 → 逐段重试」的连锁浪费。
+取该论文正文 6 段、约 1100 prompt tokens 实测：
+
+| 设置 | finish_reason | completion | 其中推理 | 返回条目 |
+| --- | --- | ---: | ---: | --- |
+| 默认（推理开） | `length` | 2048 | 1668 | 非法 JSON（0/6 可用） |
+| `thinking` 关闭 | `stop` | 600 | — | 6/6，JSON 合法 |
+
+也就是说关闭推理不只是省钱：它让 JSON 批次协议真正跑通，结构规则、标题上下文与术语表
+才会实际生效；推理开时一旦截断，整批会退回 `ILTranslator.translate_paragraph` 的逐段直译
+（无 JSON 结构规则、无术语表），**质量反而下降**。BabelDOC 默认批次较小（≤5 段 / ≤200 tokens），
+所以平时多半能勉强返回，但 4 页实测仍有 34 次回退（关闭后 7 次）。
+
+
+### 9.3 术语自动提取是第二笔开销
+
+`automatic_term_extractor.procress()` **每页发一次**请求（`process_page`），提示词含整页原文 +
+可选的用户术语库，输出是 JSON 术语表。4 页实测：24 s、6.9k tokens，与翻译正文（26 s）同量级；
+17 页论文的截图里 `Term extraction tokens: total=299888` 就是这一阶段。
+它只有在「要术语表 CSV」或「想用自动术语表统一全文译法」时才值得；本项目因此在
+「保存自动术语表」关闭时不再自动提取（`app.py::_normalize_job_payload`）。
+
+### 9.4 并发：workers 而不是 QPS
+
+`--qps` 只限制**请求发起**间隔（`RateLimiter`），`--pool-max-workers` 才决定同时在飞的请求数，
+BabelDOC 默认让 workers = qps（默认 4）。一条请求就是一次 HTTP 往返，模型越慢，加大 workers 收益越大；
+本项目默认 8（上限 32），被 429 限流时应调小，Google 免费接口固定 2。
+
+### 9.5 用量口径
+
+`babeldoc/main.py` 在结尾打印 `Total/Prompt/Completion tokens`（来自翻译器实例的累计值）和
+`Term extraction tokens`（来自 `translation_config.term_extraction_token_usage`）。
+同一模型做两件事时，后者是**前者的子集**，再加一遍会让界面与费用虚高约 40%
+（截图中的 449.5k/761.1k 实际为 342k/569k）。只有配置了独立术语模型时才会多打印
+`Term extraction translator raw tokens`，那一行才需要额外累加。
+`core/runner.py::Job.total_usage()` 按 `term_separate` 标记区分，并在 UI 显示「其中术语提取 N」。

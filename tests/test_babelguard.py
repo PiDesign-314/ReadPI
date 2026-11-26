@@ -49,6 +49,7 @@ ENV_NAMES = (
     "BABELDOC_STUDIO_GUARD_RETRIES",
     "BABELDOC_STUDIO_GUARD_BACKOFF",
     "BABELDOC_STUDIO_GUARD_OWNER",
+    "BABELDOC_STUDIO_THINKING",
 )
 
 PARAGRAPH_KEYS = {
@@ -234,6 +235,22 @@ def build_fakes(monkeypatch, module):
 
     translator_module = types.ModuleType(TRANSLATOR)
     translator_module.BaseTranslator = FakeBaseTranslator
+
+    class FakeOpenAITranslator(FakeBaseTranslator):
+        """Only the attributes the thinking patch touches.
+
+        The real class reads ``thinking`` from the CLI flag and stores the
+        request-body extras in ``extra_body``; a translator built for term
+        extraction (separate model) has both empty.
+        """
+
+        def __init__(self, model="fake-model", thinking=None, **kwargs):
+            super().__init__()
+            self.model = model
+            self.thinking = thinking
+            self.extra_body = {}
+
+    translator_module.OpenAITranslator = FakeOpenAITranslator
     created[TRANSLATOR] = translator_module
 
     class FakeILTranslator:
@@ -913,6 +930,40 @@ def test_translator_returns_last_empty_after_retries(workspace, monkeypatch):
 
 
 # --- post_translate_paragraph patch ----------------------------------------
+
+
+def test_thinking_switch_reaches_every_translator(workspace, monkeypatch):
+    """A separate term-extraction model must not keep reasoning on."""
+    module, tmp = workspace
+    fakes = build_fakes(monkeypatch, module)
+    enable_guard(
+        module,
+        monkeypatch,
+        status_path=tmp / "status.json",
+        log_path=tmp / "events.jsonl",
+    )
+    monkeypatch.setenv(module.THINKING_ENV, "disabled")
+    assert module.install() is True
+    # The translation translator: the CLI flag did not set it here either.
+    engine = fakes.translator.OpenAITranslator()
+    assert engine.thinking == "disabled"
+    assert engine.extra_body["thinking"] == {"type": "disabled"}
+    # An explicitly configured translator keeps its own decision.
+    explicit = fakes.translator.OpenAITranslator(thinking="enabled")
+    assert explicit.thinking == "enabled"
+    assert explicit.extra_body == {}
+    events = read_jsonl(tmp / "events.jsonl")
+    assert any(item["event"] == "thinking_applied" for item in events)
+
+
+def test_thinking_switch_absent_leaves_translators_alone(workspace, monkeypatch):
+    module, tmp = workspace
+    fakes = build_fakes(monkeypatch, module)
+    enable_guard(module, monkeypatch, status_path=tmp / "status.json")
+    assert module.install() is True
+    engine = fakes.translator.OpenAITranslator()
+    assert engine.thinking is None
+    assert engine.extra_body == {}
 
 
 def test_post_translate_keeps_original_on_empty_translation(workspace, monkeypatch):

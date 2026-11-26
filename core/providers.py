@@ -13,6 +13,8 @@ PRESETS: list[dict] = [
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "models": ["glm-4-flash", "glm-4-air", "glm-4-plus", "glm-4.6", "glm-4.5-air"],
         "hint": "glm-4-flash 价格低、速度快，适合长文档；glm-4-plus 质量更高。",
+        # GLM 4.5+ accepts ``thinking: {"type": "enabled"|"disabled"}``.
+        "thinking": True,
     },
     {
         "id": "openai",
@@ -28,6 +30,8 @@ PRESETS: list[dict] = [
         "models": ["deepseek-flash", "deepseek-v4-pro"],
         "hint": "deepseek-flash（V4.1 Flash）速度快、成本低，适合整篇论文翻译；"
         "deepseek-v4-pro 质量更高，适合排版复杂的论文。",
+        # DeepSeek documents ``thinking: {"type": "enabled"|"disabled"}``.
+        "thinking": True,
     },
     {
         "id": "qwen",

@@ -42,6 +42,7 @@ from core import (  # noqa: E402
     providers,
     runner,
     toc as toc_reader,
+    update,
     zotero,
     zotero_library,
 )
@@ -49,14 +50,15 @@ from core.languages import LANGUAGES  # noqa: E402
 
 WEB_DIR = BASE_DIR / "web"
 
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.9.1"
 # The reader checks these before trusting the server with the newer annotation
 # types; a stale process keeps an old API alive and silently drops them.  The
 # Zotero add-on uses "zotero" (plus the optional features) to tell a capable
-# server from an old build.
+# server from an old build, and the pages use "update-check" before wiring the
+# in-app update notice.
 API_FEATURES = (
     "text", "ink", "styles", "fonts", "margin-notes", "toc", "ai-reader", "notes",
-    "notes-ai", "zotero", "zotero-library", "zotero-translate",
+    "notes-ai", "zotero", "zotero-library", "zotero-translate", "update-check",
 )
 
 
@@ -494,6 +496,10 @@ def bootstrap():
                     "base_url": item["base_url"],
                     "models": item["models"],
                     "hint": item["hint"],
+                    # Providers that document the thinking switch the
+                    # 「模型推理」setting drives; the UI greys the row out
+                    # elsewhere so nobody wonders why the toggle does nothing.
+                    "thinking": bool(item.get("thinking")),
                 }
                 for item in providers.PRESETS
             ],
@@ -665,6 +671,30 @@ def _normalize_job_payload(payload: dict) -> tuple[dict, list[str]]:
     page_mode = payload.get("page_mode") or "all"
     page_range = (payload.get("page_range") or "").strip()
 
+    thinking_mode = str(
+        payload.get("thinking_mode") or settings.get("thinking_mode") or "off"
+    ).strip().lower()
+    if thinking_mode not in runner.THINKING_MODES:
+        thinking_mode = "auto"
+    try:
+        workers = int(payload.get("pool_workers") or settings.get("pool_workers") or 8)
+    except (TypeError, ValueError):
+        workers = 8
+    workers = max(1, min(workers, runner.MAX_POOL_WORKERS))
+    if provider_id == "google_free":
+        # The free endpoint throttles hard; more workers only produce 429s.
+        workers = min(workers, 2)
+
+    # Auto term extraction is a whole extra model round trip per page (measured
+    # on a 4-page paper: 24 s and ~7k tokens — as expensive as translating the
+    # document).  Its only products are the in-run glossary and the CSV, so when
+    # the user does not want the CSV it is skipped: the curated 术语库 (if any)
+    # still drives terminology consistency.
+    auto_glossary = bool(payload.get("auto_glossary", True)) and provider_id != "google_free"
+    save_glossary = bool(payload.get("save_glossary", True)) and provider_id != "google_free"
+    if not save_glossary:
+        auto_glossary = False
+
     cfg = {
         "provider": provider_id,
         "base_url": base_url,
@@ -676,14 +706,16 @@ def _normalize_job_payload(payload: dict) -> tuple[dict, list[str]]:
         "page_range": page_range,
         "dual_mode": payload.get("dual_mode") or "side",
         "glossary_paths": glossary.resolve_paths(glossary_ids),
-        "auto_glossary": bool(payload.get("auto_glossary", True)) and provider_id != "google_free",
-        "save_glossary": bool(payload.get("save_glossary", True)) and provider_id != "google_free",
+        "auto_glossary": auto_glossary,
+        "save_glossary": save_glossary,
         "skip_references": bool(payload.get("skip_references", True)),
         "reference_page": payload.get("reference_page") or "",
         "output_dir": str(Path(payload.get("output_dir") or config.DEFAULTS["output_dir"])),
         "watermark": payload.get("watermark") or "no_watermark",
         "open_when_done": bool(payload.get("open_when_done", True)),
         "qps": min(int(payload.get("qps") or 4), 2) if provider_id == "google_free" else int(payload.get("qps") or 4),
+        "pool_workers": workers,
+        "thinking_mode": thinking_mode,
         "custom_prompt": payload.get("custom_prompt") or "",
         "price_input": payload.get("price_input") or "",
         "price_output": payload.get("price_output") or "",
@@ -1559,6 +1591,125 @@ def zotero_plugin_xpi():
     response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# --------------------------------------------------------------------------- #
+# In-app update check (GitHub Releases)
+# --------------------------------------------------------------------------- #
+def _update_local_only():
+    """Checking/downloading is a local-desktop feature; other hosts get 403."""
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        return _error("仅本机可用", 403)
+    return None
+
+
+def _update_body() -> dict:
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _update_offline_payload(message: str = update.SOFT_ERROR) -> dict:
+    try:
+        auto_check = update.prefs().get("auto_check", True)
+    except Exception:
+        auto_check = True
+    return {
+        "ok": False,
+        "current": update.current_version(),
+        "latest": "",
+        "update_available": False,
+        "skipped": False,
+        "skip_version": "",
+        "auto_check": auto_check,
+        "release": None,
+        "source": "none",
+        "checked_at": 0.0,
+        "stale": False,
+        "error": message,
+    }
+
+
+@app.get("/api/update/check")
+def update_check():
+    """Newest release; ``force=1`` refreshes, ``cache_only=1`` never touches the net."""
+    denied = _update_local_only()
+    if denied:
+        return denied
+    force = request.args.get("force", "") in {"1", "true", "yes", "on"}
+    cache_only = request.args.get("cache_only", "") in {"1", "true", "yes", "on"}
+    try:
+        payload = update.check(force=force, cache_only=cache_only)
+    except Exception:
+        try:
+            payload = update.check(cache_only=True)
+        except Exception:
+            payload = _update_offline_payload()
+    return _json(payload)
+
+
+@app.get("/api/update/download/status")
+def update_download_status():
+    denied = _update_local_only()
+    if denied:
+        return denied
+    try:
+        state = update.download_state()
+    except Exception as exc:
+        return _error(f"无法读取下载状态：{exc}", 500)
+    return _json({"ok": True, "download": state})
+
+
+@app.post("/api/update/download")
+def update_download():
+    denied = _update_local_only()
+    if denied:
+        return denied
+    asset = str(_update_body().get("asset") or "").strip()
+    try:
+        state = update.start_download(asset)
+    except Exception as exc:
+        return _error(f"下载失败：{exc}", 500)
+    if state.get("state") == "error" and not state.get("asset"):
+        return _error(state.get("error") or "没有可下载的安装包", 400)
+    return _json({"ok": True, "download": state})
+
+
+@app.post("/api/update/download/cancel")
+def update_download_cancel():
+    denied = _update_local_only()
+    if denied:
+        return denied
+    try:
+        state = update.cancel_download()
+    except Exception as exc:
+        return _error(f"无法取消下载：{exc}", 500)
+    return _json({"ok": True, "download": state})
+
+
+@app.post("/api/update/skip")
+def update_skip():
+    denied = _update_local_only()
+    if denied:
+        return denied
+    version = _update_body().get("version", "")
+    try:
+        stored = update.set_skip_version(version)
+    except Exception:
+        stored = ""
+    return _json({"ok": True, "skip_version": stored})
+
+
+@app.post("/api/update/prefs")
+def update_prefs():
+    denied = _update_local_only()
+    if denied:
+        return denied
+    body = _update_body()
+    try:
+        result = update.save_prefs(body)
+    except Exception:
+        result = update.prefs()
+    return _json({"ok": True, "auto_check": bool(result.get("auto_check", True))})
 
 
 # --------------------------------------------------------------------------- #

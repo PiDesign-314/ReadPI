@@ -91,6 +91,8 @@ LOG_ENV = "BABELDOC_STUDIO_GUARD_LOG"
 DOC_ENV = "BABELDOC_STUDIO_GUARD_DOC"
 RETRIES_ENV = "BABELDOC_STUDIO_GUARD_RETRIES"
 BACKOFF_ENV = "BABELDOC_STUDIO_GUARD_BACKOFF"
+#: ``--openai-thinking`` value the app wants applied to every translator.
+THINKING_ENV = "BABELDOC_STUDIO_THINKING"
 OWNER_ENV = "BABELDOC_STUDIO_GUARD_OWNER"
 
 SCHEMA = 1
@@ -1438,6 +1440,51 @@ def _make_render_paragraph_to_char(guard: _Guard):
     return factory
 
 
+def _make_openai_thinking(guard: _Guard, thinking: str):
+    """Attach ``thinking: {"type": …}`` to translators that did not set it.
+
+    BabelDOC's ``--openai-thinking`` flag only configures the *translation*
+    translator.  When a separate term-extraction model is configured,
+    ``OpenAITranslator`` is built without the flag and keeps hidden reasoning
+    on — which is where a large share of the term-extraction cost comes from.
+    Reasoning output is what makes a small batch cost hundreds of extra tokens,
+    so the same switch is applied here for consistency.
+    """
+
+    def factory(original, signature):
+        @functools.wraps(original)
+        def wrapper(*args, **kwargs):
+            result = original(*args, **kwargs)
+            try:
+                client = args[0] if args else kwargs.get("self")
+                if client is None or getattr(client, "thinking", None):
+                    return result
+                extra_body = dict(getattr(client, "extra_body", None) or {})
+                extra_body.setdefault("thinking", {"type": thinking})
+                client.extra_body = extra_body
+                client.thinking = thinking
+                guard.log_event("thinking_applied", type=thinking)
+            except Exception as exc:
+                guard.add_error(f"thinking patch: {exc}")
+            return result
+
+        return wrapper
+
+    return factory
+
+
+def _patch_openai_thinking(guard: _Guard) -> bool:
+    thinking = str(os.environ.get(THINKING_ENV) or "").strip().lower()
+    if thinking not in {"enabled", "disabled"}:
+        return False
+    translator_class = getattr(_load(TRANSLATOR_MODULE), "OpenAITranslator", None)
+    if translator_class is None:
+        return False
+    return _wrap_method(
+        translator_class, "__init__", _make_openai_thinking(guard, thinking)
+    )
+
+
 def _patch_translation_cache(guard: _Guard) -> bool:
     cache_class = getattr(_load(CACHE_MODULE), "TranslationCache")
     patched = _wrap_method(cache_class, "get", _make_cache_get(guard))
@@ -1498,6 +1545,7 @@ def _patch_pdf_creater(guard: _Guard) -> bool:
 _PATCHERS = (
     ("translation_cache", _patch_translation_cache),
     ("translator_retry", _patch_translator),
+    ("translator_thinking", _patch_openai_thinking),
     ("il_translator", _patch_il_translator),
     ("il_translator_llm_only", _patch_il_translator_llm_only),
     ("typesetting", _patch_typesetting),

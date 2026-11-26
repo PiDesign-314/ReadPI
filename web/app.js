@@ -58,6 +58,8 @@
     btnReveal: $("#btn-reveal"),
     rememberKey: $("#remember-key"),
     qps: $("#qps"),
+    poolWorkers: $("#pool-workers"),
+    thinkingMode: $("#thinking-mode"),
     watermark: $("#watermark"),
     termModel: $("#term-model"),
     customPrompt: $("#custom-prompt"),
@@ -389,7 +391,12 @@
     el.quickProvider.innerHTML = providerOptions;
     state.providerModels = {};
     state.boot.providers.forEach((item) => {
-      state.providerModels[item.id] = { models: item.models, base_url: item.base_url, hint: item.hint };
+      state.providerModels[item.id] = {
+        models: item.models,
+        base_url: item.base_url,
+        hint: item.hint,
+        thinking: Boolean(item.thinking),
+      };
     });
   }
 
@@ -784,6 +791,8 @@
     el.outputDir.value = settings.output_dir || "";
     el.watermark.value = settings.watermark || "no_watermark";
     el.qps.value = settings.qps || 4;
+    el.poolWorkers.value = settings.pool_workers || 8;
+    el.thinkingMode.value = settings.thinking_mode || "off";
     el.termModel.value = settings.term_model || "";
     el.customPrompt.value = settings.custom_prompt || "";
     el.skipScanned.checked = !!settings.skip_scanned;
@@ -832,6 +841,8 @@
       watermark: el.watermark.value,
       open_when_done: el.openWhenDone.checked,
       qps: Number(el.qps.value) || 4,
+      pool_workers: Number(el.poolWorkers.value) || 8,
+      thinking_mode: el.thinkingMode.value || "off",
       custom_prompt: el.customPrompt.value,
       skip_scanned: el.skipScanned.checked,
       ocr_workaround: el.ocrWorkaround.checked,
@@ -915,6 +926,14 @@
     if (free) closeAllCombos(null);
     el.baseUrl.placeholder = free ? "内置免费接口，无需填写" : "https://…/v1";
     el.apiKey.placeholder = free ? "无需 API Key" : "sk-…";
+    if (el.thinkingMode) {
+      const preset = state.providerModels[providerId] || {};
+      const supported = Boolean(preset.thinking);
+      el.thinkingMode.disabled = !supported;
+      el.thinkingMode.title = supported
+        ? "关闭后模型不再先推理再翻译：输出 tokens 约为 1/4，速度更快"
+        : "当前服务商不支持该开关，设置会被忽略";
+    }
     if (free) {
       el.baseUrl.value = "";
       el.apiKey.value = "";
@@ -1357,6 +1376,12 @@
     let html =
       `本次用量：输入 ${formatTokens(usage.prompt_tokens)} · ` +
       `输出 ${formatTokens(usage.completion_tokens)} tokens`;
+    const termTokens =
+      (Number(usage.term_prompt_tokens) || 0) +
+      (Number(usage.term_completion_tokens) || 0);
+    if (termTokens > 0) {
+      html += ` · <span class="muted">其中术语提取 ${formatTokens(termTokens)}</span>`;
+    }
     if (money) {
       const source = job.cost.source === "override" ? "自定义单价" : "参考价";
       html += ` · 预计花费 <span class="amount">${money}</span>` +
@@ -1857,6 +1882,8 @@
     el.dualMode.addEventListener("change", scheduleSave);
     el.watermark.addEventListener("change", scheduleSave);
     el.qps.addEventListener("change", scheduleSave);
+    el.poolWorkers.addEventListener("change", scheduleSave);
+    el.thinkingMode.addEventListener("change", scheduleSave);
     el.termModel.addEventListener("input", scheduleSave);
     el.customPrompt.addEventListener("input", scheduleSave);
     el.skipScanned.addEventListener("change", scheduleSave);
