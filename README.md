@@ -4,7 +4,7 @@
 
 <h1>ReadPI</h1>
 
-<p><strong>把 PDF 论文翻成双语，保留公式、图表和原始排版；翻译、AI 助读、笔记与批注在同一个本地窗口完成。</strong></p>
+<p><strong>把 PDF 翻译，保留公式、图表和原始排版；Zotero文献库互联、AI 助读、笔记与批注在同一个本地窗口完成。</strong></p>
 
 <p>
   <a href="https://github.com/PiDesign-314/ReadPI/releases/latest">
@@ -21,7 +21,7 @@
 
 ReadPI 是一个面向 **PDF 论文 / 技术文档** 的本地翻译与阅读工作台。底层调用
 [BabelDOC](https://github.com/funstory-ai/BabelDOC) 完成版面分析与重排，上层是本项目自研的
-**Apple HIG 风格界面**、PDF.js 阅读器、AI 助读、富文本笔记与 Zotero 接入。
+**Apple HIG 风格界面**、PDF.js 阅读器、AI 助读、富文本笔记与 **Zotero 接入**。
 
 从「拖入 PDF」到「对照阅读、提问、记笔记、做批注」都在一个应用里完成；PDF、批注、笔记和 API Key
 默认只留在本机。
